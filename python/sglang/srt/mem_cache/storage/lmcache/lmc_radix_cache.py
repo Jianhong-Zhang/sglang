@@ -152,7 +152,7 @@ class LMCRadixCache(RadixCache):
 
         # MP is the default. To use the in-process layerwise connector,
         # set ``self._mode = LMCacheMode.IP`` here.
-        self._mode = LMCacheMode.MP
+        self._mode = LMCacheMode.IP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
