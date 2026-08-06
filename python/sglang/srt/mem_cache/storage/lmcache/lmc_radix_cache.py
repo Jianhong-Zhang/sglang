@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import logging
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -17,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_memory, get_server_args, get_spec
-from sglang.srt.utils import create_device_stream, device_stream_context
+from sglang.srt.utils import device_stream_context
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -160,9 +161,10 @@ class LMCRadixCache(RadixCache):
             self.load_stream_ctx = nullcontext()
             self.store_stream_ctx = nullcontext()
 
-        # MP is the default. To use the in-process layerwise connector,
-        # set ``self._mode = LMCacheMode.IP`` here.
-        self._mode = LMCacheMode.IP
+        # MP (multi-process) is the default. XPU defaults to IP (in-process
+        # layerwise) because the MP connector shares the KV cache via CUDA IPC
+        # (``Tensor._share_cuda_``), which is unavailable on XPU.
+        self._mode = LMCacheMode.IP if self.device.type == "xpu" else LMCacheMode.MP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
