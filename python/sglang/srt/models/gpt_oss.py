@@ -1004,12 +1004,7 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-<<<<<<< HEAD
-            if _is_cuda:
-                weight = weight.cuda()
-=======
             weight = weight.to(get_device())
->>>>>>> 6249d51e16 ([XPU] Add MXFP4 W4A16 MoE inference support for Intel Xe2 (GPT-OSS))
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
