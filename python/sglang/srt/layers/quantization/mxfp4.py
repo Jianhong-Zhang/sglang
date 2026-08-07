@@ -1789,14 +1789,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_output = topk_output.to_standard()
                 topk_weights = topk_output.topk_weights
                 topk_ids = topk_output.topk_ids
-                # Convert UE8M0 uint8 scales to float32 direct multipliers:
-                # scale_f32 = 2^(uint8_exponent - 127)
-                w1_scale_f32 = torch.exp2(
-                    (layer.w13_weight_scale.to(torch.int32) - 127).to(torch.float32)
-                )
-                w2_scale_f32 = torch.exp2(
-                    (layer.w2_weight_scale.to(torch.int32) - 127).to(torch.float32)
-                )
+                w1_scale_mxfp4 = layer.w13_weight_scale.view(torch.uint8)
+                w2_scale_mxfp4 = layer.w2_weight_scale.view(torch.uint8)
                 # Read activation and gemm1 scaling params from the layer's
                 # MoeRunnerConfig so this path is not hardcoded to GPT-OSS-20b.
                 # For GPT-OSS: activation="silu" + gemm1_alpha set → sgl_fused_experts
@@ -1827,8 +1821,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     b2=getattr(layer, "w2_weight_bias", None),
                     activation=activation,
                     use_mxfp4_w4a16=True,
-                    w1_scale=w1_scale_f32,
-                    w2_scale=w2_scale_f32,
+                    w1_scale=w1_scale_mxfp4,
+                    w2_scale=w2_scale_mxfp4,
                     routed_scaling_factor=getattr(
                         self.runner.config, "routed_scaling_factor", None
                     ),
