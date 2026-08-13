@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -592,7 +593,13 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        # print(
+        #     "[process_batch_result_decode] call stack:\n"
+        #     + "".join(traceback.format_stack()),
+        #     flush=True,
+        # )
         if result.copy_done is not None:
+        #     print(f"[copy_done] decode: {type(result.copy_done)}", flush=True)
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()

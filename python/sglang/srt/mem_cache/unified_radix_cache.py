@@ -517,6 +517,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        # Hard-coded on; upstream gates this on
+        # server_args.disable_hicache_l1_prefix_reuse, which does not exist here.
+        self.disable_hicache_l1_prefix_reuse = True
+        self._l1_demote_in_progress = False
+
         if storage_backend is not None:
             self._apply_storage_runtime_config(
                 storage_backend=storage_backend,
@@ -551,13 +556,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        res = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         )
+        print(
+            f"[no-L1-prefix] match_prefix: req_tokens={len(key)} "
+            f"L1(device)_hit={len(res.device_indices)} "
+            f"L2(host)_hit={res.host_hit_length}",
+            flush=True,
+        )
+        return res
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -721,6 +733,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+
+        self._maybe_demote_backuped_l1_leaves()
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -1388,6 +1402,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.evictable_host_leaves.add(node)
         else:
             self.evictable_host_leaves.discard(node)
+
+    def _is_l1_demote_candidate(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        return (
+            node is not self.root_node
+            and node in self.evictable_device_leaves
+            # component_data is a list indexed by ComponentType and sized for
+            # every type, so only the components this tree actually uses count.
+            and all(node.component_data[ct].lock_ref == 0 for ct in self.tree_components)
+            and not node.evicted
+            and node.backuped
+            and cd.value is not None
+            and node.id not in self.ongoing_load_back
+            and node.id not in self.ongoing_write_through
+        )
+
+    def _maybe_demote_backuped_l1_leaves(self) -> int:
+        if not self.disable_hicache_l1_prefix_reuse:
+            return 0
+
+        if self._l1_demote_in_progress:
+            return 0
+
+        self._l1_demote_in_progress = True
+        try:
+            total = 0
+
+            while True:
+                victims = [
+                    node
+                    for node in list(self.evictable_device_leaves)
+                    if self._is_l1_demote_candidate(node)
+                ]
+
+                if not victims:
+                    return total
+
+                progressed = False
+                for node in victims:
+                    # Re-check because demoting one leaf can change parent/child state.
+                    if not self._is_l1_demote_candidate(node):
+                        continue
+
+                    num_tokens = len(node.component_data[BASE_COMPONENT_TYPE].value)
+                    self._evict_to_host(node)
+                    total += num_tokens
+                    progressed = True
+                    print(
+                        f"[no-L1-prefix] demoted node_id={node.id} "
+                        f"tokens={num_tokens} off GPU (still on host); "
+                        f"evictable_size={self.evictable_size()}",
+                        flush=True,
+                    )
+
+                if not progressed:
+                    return total
+        finally:
+            self._l1_demote_in_progress = False
 
     def _evict_to_host(
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
@@ -2295,15 +2367,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
+
+            did_ack = False
+
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
+
+                did_ack = True
+
             finish_count -= 1
+
+            if did_ack:
+                self._maybe_demote_backuped_l1_leaves()
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
         if cc is None:
             return
+
+        did_ack = False
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
@@ -2322,7 +2405,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
+
+                did_ack = True
+
             finish_count -= 1
+
+        if did_ack:
+            self._maybe_demote_backuped_l1_leaves()
 
     # ---- HiCache: Scheduler Entry Points ----
 

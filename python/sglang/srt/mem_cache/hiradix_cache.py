@@ -63,6 +63,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
@@ -76,7 +77,7 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
-
+        print('buke: ', self.kv_cache)
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -181,6 +182,15 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+
+        # Hard-coded on; upstream gates this on
+        # server_args.disable_hicache_l1_prefix_reuse, which does not exist here.
+        self.disable_hicache_l1_prefix_reuse = True
+        self._l1_demote_in_progress = False
+
+        if self.disable_hicache_l1_prefix_reuse:
+            assert server_args.enable_hierarchical_cache
+            assert not server_args.disable_radix_cache
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -763,19 +773,42 @@ class HiRadixCache(RadixCache):
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
+            logger.debug(
+                "[D2H] write_backup: skip node_id=%d, parent node_id=%d not backuped "
+                "(backups must form a contiguous prefix from root)",
+                node.id,
+                node.parent.id,
+            )
             return 0
 
+        logger.debug(
+            "[D2H] write_backup: node_id=%d tokens=%d write_back=%s",
+            node.id,
+            len(node.value),
+            write_back,
+        )
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
             **self._get_extra_pools(),
         )
         if host_indices is None:
+            logger.debug(
+                "[D2H] write_backup: host alloc failed for node_id=%d, evicting %d "
+                "host tokens and retrying",
+                node.id,
+                len(node.value),
+            )
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
                 **self._get_extra_pools(),
+            )
+        if host_indices is None:
+            logger.debug(
+                "[D2H] write_backup: host alloc failed again for node_id=%d, giving up",
+                node.id,
             )
         if host_indices is not None:
             node.host_value = host_indices.clone()
@@ -896,13 +929,35 @@ class HiRadixCache(RadixCache):
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
+            logger.debug(
+                "[D2H] _inc_hit_count: skip node_id=%d policy=%s chunked=%s",
+                node.id,
+                self.cache_controller.write_policy,
+                chunked,
+            )
             return
         node.hit_count += 1
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
+                logger.debug(
+                    "[D2H] _inc_hit_count: node_id=%d hit_count=%d >= threshold=%d, "
+                    "triggering write_backup of %d tokens",
+                    node.id,
+                    node.hit_count,
+                    self.write_through_threshold,
+                    len(node.value),
+                )
                 self.write_backup(node)
+            else:
+                logger.debug(
+                    "[D2H] _inc_hit_count: node_id=%d hit_count=%d < threshold=%d, "
+                    "not backing up yet",
+                    node.id,
+                    node.hit_count,
+                    self.write_through_threshold,
+                )
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -935,12 +990,24 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
+
+            did_ack = False
+
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id, release_lock=True)
+
+                did_ack = True
+
             finish_count -= 1
+
+            if did_ack:
+                self._maybe_demote_backuped_l1_leaves()
 
     def loading_check(self):
         finish_count = 0
+
+        did_ack = False
+
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
                 if not finish_event.query():
@@ -958,7 +1025,13 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+                did_ack = True
+
             finish_count -= 1
+
+        if did_ack:
+            self._maybe_demote_backuped_l1_leaves()
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete."""
@@ -1459,6 +1532,12 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        print(
+            f"[no-L1-prefix] match_prefix: req_tokens={len(key)} "
+            f"L1(device)_hit={len(value)} L2(host)_hit={host_hit_length}",
+            flush=True,
+        )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1730,3 +1809,62 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+
+    def _is_l1_demote_candidate(self, node: TreeNode) -> bool:
+        return (
+            node is not self.root_node
+            and node in self.evictable_leaves
+            and node.lock_ref == 0
+            and not node.evicted
+            and node.backuped
+            and node.value is not None
+            and node.id not in self.ongoing_load_back
+            and node.id not in self.ongoing_write_through
+        )
+
+    def _maybe_demote_backuped_l1_leaves(self) -> int:
+        if not self.disable_hicache_l1_prefix_reuse:
+            return 0
+
+        if self._l1_demote_in_progress:
+            return 0
+
+        self._l1_demote_in_progress = True
+        try:
+            total = 0
+
+            while True:
+                victims = [
+                    node
+                    for node in list(self.evictable_leaves)
+                    if self._is_l1_demote_candidate(node)
+                ]
+
+                if not victims:
+                    return total
+
+                progressed = False
+                for node in victims:
+                    # Re-check because demoting one leaf can change parent/child state.
+                    if not self._is_l1_demote_candidate(node):
+                        continue
+
+                    num_tokens = len(node.value)
+                    total += self._evict_backuped(node)
+                    progressed = True
+                    print(
+                        f"[no-L1-prefix] demoted node_id={node.id} "
+                        f"tokens={num_tokens} off GPU (still on host); "
+                        f"evictable_size={self.evictable_size_}",
+                        flush=True,
+                    )
+
+                if not progressed:
+                    return total
+        finally:
+            self._l1_demote_in_progress = False
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        ret = super().cache_finished_req(req, is_insert=is_insert)
+        self._maybe_demote_backuped_l1_leaves()
+        return ret
