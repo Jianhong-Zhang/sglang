@@ -185,7 +185,7 @@ class HiRadixCache(RadixCache):
 
         # Hard-coded on; upstream gates this on
         # server_args.disable_hicache_l1_prefix_reuse, which does not exist here.
-        self.disable_hicache_l1_prefix_reuse = True
+        self.disable_hicache_l1_prefix_reuse = False
         self._l1_demote_in_progress = False
 
         if self.disable_hicache_l1_prefix_reuse:
@@ -1532,10 +1532,10 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
-        print(
-            f"[no-L1-prefix] match_prefix: req_tokens={len(key)} "
+        logger.debug(
+            f"[no-L1-prefix] match_prefix in hiradix_cache.py: req_tokens={len(key)} "
             f"L1(device)_hit={len(value)} L2(host)_hit={host_hit_length}",
-            flush=True,
+            
         )
 
         return MatchResult(
@@ -1852,11 +1852,11 @@ class HiRadixCache(RadixCache):
                     num_tokens = len(node.value)
                     total += self._evict_backuped(node)
                     progressed = True
-                    print(
-                        f"[no-L1-prefix] demoted node_id={node.id} "
+                    logger.debug(
+                        f"hiradix_cache.py [no-L1-prefix] demoted node_id={node.id} "
                         f"tokens={num_tokens} off GPU (still on host); "
                         f"evictable_size={self.evictable_size_}",
-                        flush=True,
+                        
                     )
 
                 if not progressed:

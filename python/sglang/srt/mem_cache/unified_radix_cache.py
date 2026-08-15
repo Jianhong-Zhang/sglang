@@ -519,7 +519,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Hard-coded on; upstream gates this on
         # server_args.disable_hicache_l1_prefix_reuse, which does not exist here.
-        self.disable_hicache_l1_prefix_reuse = True
+        self.disable_hicache_l1_prefix_reuse = False
         self._l1_demote_in_progress = False
 
         if storage_backend is not None:
@@ -563,11 +563,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         )
-        print(
-            f"[no-L1-prefix] match_prefix: req_tokens={len(key)} "
+        logger.debug(
+            f"unified_radix_cache.py [no-L1-prefix] match_prefix: req_tokens={len(key)} "
             f"L1(device)_hit={len(res.device_indices)} "
             f"L2(host)_hit={res.host_hit_length}",
-            flush=True,
+            
         )
         return res
 
@@ -1449,11 +1449,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._evict_to_host(node)
                     total += num_tokens
                     progressed = True
-                    print(
-                        f"[no-L1-prefix] demoted node_id={node.id} "
+                    logger.debug(
+                        f"unified_radix_cache.py [no-L1-prefix] demoted node_id={node.id} "
                         f"tokens={num_tokens} off GPU (still on host); "
                         f"evictable_size={self.evictable_size()}",
-                        flush=True,
+                        
                     )
 
                 if not progressed:
