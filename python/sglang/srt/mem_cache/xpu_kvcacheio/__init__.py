@@ -86,7 +86,7 @@ def _trace(name, src_indices, dst_indices, item_size, num_layers, num_kv, **extr
     else:
         src_lo = src_hi = dst_lo = dst_hi = None
     logger.debug(
-        "[D2H/H2D kernel] %s: items=%d layers=%d num_kv=%d item_size=%d "
+        "[transfer init kernel] %s: items=%d layers=%d num_kv=%d item_size=%d "
         "total=%.3f MiB src_idx(dev=%s dtype=%s range=[%s,%s]) "
         "dst_idx(dev=%s dtype=%s range=[%s,%s])%s",
         name,

@@ -119,7 +119,7 @@ void launch_transfer(
   // Printed before submit; the launch itself is async, so this is a "queued"
   // marker, not a completion marker.
   HICACHE_TRACE(
-      "[D2H/H2D sycl] launch_transfer: access_width=%zuB items=%lld layers=%lld "
+      "[kvcacheio.sycl] launch_transfer: access_width=%zuB items=%lld layers=%lld "
       "num_kv=%lld item_size=%lld vecs_per_item=%lld work_items=%lld "
       "groups=%lld x %lld total=%.3f MiB queue=%p\n",
       sizeof(VecT),
@@ -476,6 +476,15 @@ void transfer_kv_per_layer(
   OffsetLayerFirst src{raw(src_k), raw(src_v), item_size};
   OffsetLayerFirst dst{raw(dst_k), raw(dst_v), item_size};
 
+  HICACHE_TRACE(
+      "[H2D sycl] transfer_kv_per_layer: src_k=%p src_v=%p (host) "
+      "dst_k=%p dst_v=%p (device) item_size=%lld\n",
+      static_cast<void*>(src.k_base),
+      static_cast<void*>(src.v_base),
+      static_cast<void*>(dst.k_base),
+      static_cast<void*>(dst.v_base),
+      static_cast<long long>(item_size));
+
   const int64_t width = pick_access_width({item_size});
   DISPATCH_ACCESS_WIDTH(
       width,
@@ -507,6 +516,16 @@ void transfer_kv_per_layer_pf_lf(
   OffsetPageFirstAtLayer src{raw(src_k), raw(src_v), src_layout_dim, item_size, layer_id};
   OffsetLayerFirst dst{raw(dst_k), raw(dst_v), item_size};
 
+  HICACHE_TRACE(
+      "[H2D sycl] transfer_kv_per_layer_pf_lf: src_k=%p src_v=%p (host) "
+      "dst_k=%p dst_v=%p (device) layer_id=%lld src_layout_dim=%lld\n",
+      static_cast<void*>(src.k_base),
+      static_cast<void*>(src.v_base),
+      static_cast<void*>(dst.k_base),
+      static_cast<void*>(dst.v_base),
+      static_cast<long long>(layer_id),
+      static_cast<long long>(src_layout_dim));
+
   const int64_t width = pick_access_width({item_size, src_layout_dim});
   DISPATCH_ACCESS_WIDTH(
       width,
@@ -533,6 +552,13 @@ void transfer_kv_per_layer_mla(
 
   OffsetLayerFirst src_off{raw(src), raw(src), item_size};
   OffsetLayerFirst dst_off{raw(dst), raw(dst), item_size};
+
+  HICACHE_TRACE(
+      "[H2D sycl] transfer_kv_per_layer_mla: src=%p (host) dst=%p (device) "
+      "item_size=%lld\n",
+      static_cast<void*>(src_off.k_base),
+      static_cast<void*>(dst_off.k_base),
+      static_cast<long long>(item_size));
 
   const int64_t width = pick_access_width({item_size});
   DISPATCH_ACCESS_WIDTH(
@@ -563,6 +589,14 @@ void transfer_kv_per_layer_mla_pf_lf(
   OffsetPageFirstAtLayer src_off{
       raw(src), raw(src), src_layout_dim, item_size, layer_id};
   OffsetLayerFirst dst_off{raw(dst), raw(dst), item_size};
+
+  HICACHE_TRACE(
+      "[H2D sycl] transfer_kv_per_layer_mla_pf_lf: src=%p (host) dst=%p (device) "
+      "layer_id=%lld src_layout_dim=%lld\n",
+      static_cast<void*>(src_off.k_base),
+      static_cast<void*>(dst_off.k_base),
+      static_cast<long long>(layer_id),
+      static_cast<long long>(src_layout_dim));
 
   const int64_t width = pick_access_width({item_size, src_layout_dim});
   DISPATCH_ACCESS_WIDTH(
