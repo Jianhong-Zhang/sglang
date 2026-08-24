@@ -638,6 +638,37 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
+    def _log_admitted_cache_hits(self, req: Req):
+        # Called only from add_one_req (first admission of a request), so the
+        # tier split is measured once and not re-reported per chunked chunk.
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        total = len(req.full_untruncated_fill_ids)
+        if total <= 0:
+            return
+        # prefix_indices already includes host tokens pulled in by init_load_back,
+        # and storage hits are a subset of host_hit_length -- see the breakdown
+        # comment in ScheduleBatch.prepare_for_extend.
+        storage_hit = min(req.host_hit_length, req.storage_hit_length)
+        host_hit = req.host_hit_length - storage_hit
+        device_hit = max(0, len(req.prefix_indices) - req.host_hit_length)
+        total_hit = device_hit + host_hit + storage_hit
+        logger.debug(
+            "[admit] rid=%s req_tokens=%d L1(device)_hit=%d (%.1f%%) "
+            "L2(host)_hit=%d (%.1f%%) L3(storage)_hit=%d (%.1f%%) "
+            "total_hit=%d (%.1f%%)",
+            req.rid,
+            total,
+            device_hit,
+            100.0 * device_hit / total,
+            host_hit,
+            100.0 * host_hit / total,
+            storage_hit,
+            100.0 * storage_hit / total,
+            total_hit,
+            100.0 * total_hit / total,
+        )
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -1020,6 +1051,7 @@ class PrefillAdder:
                     prefix_len, trunc_len, 0, req.retracted_stain
                 )
 
+        self._log_admitted_cache_hits(req)
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
