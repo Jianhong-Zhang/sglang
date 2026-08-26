@@ -3946,6 +3946,7 @@ class ServerArgs:
         """Normalize hicache-related knobs into a valid runtime configuration.
 
         Resolution order:
+        0) Map a generic "kernel" request onto the device-specific backend.
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
@@ -3957,6 +3958,10 @@ class ServerArgs:
             or self.disaggregation_decode_enable_offload_kvcache
         ):
             return
+
+        # Step 0: On XPU the "kernel" transfer kernels are CUDA/HIP only, so
+        # redirect to the SYCL implementation (or to direct if it cannot build).
+        self._resolve_xpu_io_backend()
 
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
@@ -3971,7 +3976,53 @@ class ServerArgs:
         if io_changed:
             self._resolve_layout_io_compatibility()
 
+    def _resolve_xpu_io_backend(self):
+        """Point a generic "kernel" request at the SYCL kernels when on XPU.
+
+        ``kernel`` means the CUDA/HIP kernels in ``sgl_kernel.kvcacheio``, which
+        does not exist in the XPU build at all, so both it and the ``direct``
+        transfer helpers it also provides are unavailable here. ``kernel_xpu`` is
+        therefore the only working backend on XPU, and a toolchain that cannot
+        build it is a hard error rather than a fallback.
+        """
+        if self.device != "xpu":
+            if self.hicache_io_backend == "kernel_xpu":
+                raise ValueError(
+                    f"--hicache-io-backend kernel_xpu requires an XPU device, "
+                    f"but the device is {self.device!r}."
+                )
+            return
+
+        if self.hicache_io_backend == "direct":
+            raise ValueError(
+                "--hicache-io-backend direct is not supported on XPU: its transfer "
+                "helpers live in sgl_kernel.kvcacheio, which the XPU build does not "
+                "ship. Use kernel_xpu (the default on XPU)."
+            )
+
+        if self.hicache_io_backend != "kernel":
+            return
+
+        from sglang.srt.mem_cache import xpu_kvcacheio
+
+        # Compile here, in the launcher, before any worker starts, so the build
+        # cost is paid once instead of being raced for by every TP rank on the
+        # first transfer -- and so a broken toolchain fails at startup.
+        xpu_kvcacheio.load()
+        self.hicache_io_backend = "kernel_xpu"
+        logger.info("Using the kernel_xpu (SYCL) hicache io backend on XPU.")
+
     def _resolve_layout_io_compatibility(self):
+        if self.hicache_io_backend == "kernel_xpu":
+            # The SYCL kernels implement layer_first and page_first only.
+            if self.hicache_mem_layout not in ("layer_first", "page_first"):
+                logger.warning(
+                    f"kernel_xpu io backend does not support "
+                    f"{self.hicache_mem_layout} layout, switching to layer_first"
+                )
+                self.hicache_mem_layout = "layer_first"
+            return
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -3999,7 +4050,7 @@ class ServerArgs:
 
         if self.hicache_io_backend == "direct":
             new_layout = "page_first_direct"
-        elif self.hicache_io_backend == "kernel":
+        elif self.hicache_io_backend in ("kernel", "kernel_xpu"):
             new_layout = "page_first"
         else:
             # Keep current behavior for unknown backends (e.g., kernel_ascend).
@@ -6489,7 +6540,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "kernel_xpu"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )

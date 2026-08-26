@@ -304,6 +304,9 @@ class HiCacheController:
         self.storage_stop_event = threading.Event()
 
         self.device = self.mem_pool_device.device
+        # Accelerator device type ("cuda", "xpu", "npu", ...), used to decide
+        # whether an index tensor already lives on the device.
+        self.device_type = torch.device(self.device).type
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -712,6 +715,13 @@ class HiCacheController:
         """
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            logger.debug(
+                "[D2H] write: host alloc of %d tokens FAILED for node_id=%d "
+                "(host pool free=%d)",
+                len(device_indices),
+                node_id,
+                self.mem_pool_host.available_size(),
+            )
             return None
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
@@ -749,9 +759,9 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            if host_indices.is_cuda:
+            if host_indices.device.type == self.device_type:
                 host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type == self.device_type:
                 device_indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
@@ -775,8 +785,10 @@ class HiCacheController:
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
-        if self.io_backend == "kernel":
-            if not host_indices.is_cuda:
+        if self.io_backend in ("kernel", "kernel_xpu"):
+            # Keep both index tensors device-resident: the transfer kernels read
+            # them directly, so no host round-trip (and no implicit sync) here.
+            if host_indices.device.type != self.device_type:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
@@ -830,9 +842,9 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
-            if host_indices.is_cuda:
+            if host_indices.device.type == self.device_type:
                 host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type == self.device_type:
                 device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
