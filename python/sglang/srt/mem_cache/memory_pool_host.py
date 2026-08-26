@@ -45,6 +45,19 @@ if _is_cuda or _is_hip:
     )
 if _is_npu:
     pass
+if _is_xpu:
+    # SYCL kernels, JIT-compiled on first use. sgl-kernel-xpu has no AOT
+    # kvcacheio module yet, so these are built from source in-tree.
+    from sglang.srt.mem_cache import xpu_kvcacheio
+
+    # The single-pool ("mla") entry points are signature-compatible with their
+    # CUDA namesakes, so the helpers shared by the Mamba / DeepSeek-V4 / DSA
+    # host pools can call them under the same names. Binding here is lazy: the
+    # wrappers compile on first call, not at import.
+    transfer_kv_all_layer_mla = xpu_kvcacheio.transfer_kv_all_layer_mla
+    transfer_kv_all_layer_mla_lf_pf = xpu_kvcacheio.transfer_kv_all_layer_mla_lf_pf
+    transfer_kv_per_layer_mla = xpu_kvcacheio.transfer_kv_per_layer_mla
+    transfer_kv_per_layer_mla_pf_lf = xpu_kvcacheio.transfer_kv_per_layer_mla_pf_lf
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +333,7 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend in ("kernel", "kernel_xpu"):
             # TODO: Rename the interface for clarity.
             # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
             # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
@@ -354,7 +367,20 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel_xpu":
+            # No SYCL mamba kernel; the single-pool mla helper has the same
+            # signature and moves the state verbatim (see the note at import).
+            item_size = MambaPoolHost._item_size_per_index(dst)
+            transfer_kv_per_layer_mla_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                item_size=item_size,
+                src_layout_dim=item_size * num_layers,
+            )
+        elif io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(dst)
             # Mamba JIT kernel expects all index tensors on CUDA.
             # host_indices may be on CPU (kept there by start_writing when
@@ -396,7 +422,20 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel_xpu":
+            # No SYCL mamba kernel; the single-pool mla helper has the same
+            # signature and moves the state verbatim (see the note at import).
+            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=src_ptrs,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+                dst_layout_dim=item_size * num_layers,
+                num_layers=num_layers,
+            )
+        elif io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             # Mamba JIT kernel expects all index tensors on CUDA.
             # When can_use_write_back_jit is True on the HostPoolGroup,
@@ -936,7 +975,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
-        if io_backend == "kernel" and self.layout == "layer_first":
+        if io_backend in ("kernel", "kernel_xpu") and self.layout == "layer_first":
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
                 dst_layers=self.data_ptrs,
@@ -945,7 +984,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 item_size=self.item_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend in ("kernel", "kernel_xpu") and self.layout == "page_first":
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -1008,7 +1047,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
 
-        if io_backend == "kernel" and self.layout == "layer_first":
+        if io_backend in ("kernel", "kernel_xpu") and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
                 dst=self.device_buffers[layer_id],
@@ -1016,7 +1055,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.item_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend in ("kernel", "kernel_xpu") and self.layout == "page_first":
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_buffers[layer_id],
@@ -1321,7 +1360,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
-        if io_backend == "kernel" and self.layout == "layer_first":
+        if io_backend in ("kernel", "kernel_xpu") and self.layout == "layer_first":
             assert self.data_ptrs is not None
             transfer_kv_all_layer_mla(
                 src_layers=self.device_ptrs,
@@ -1331,7 +1370,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 item_size=self.state_page_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend in ("kernel", "kernel_xpu") and self.layout == "page_first":
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -1380,7 +1419,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             return
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
-        if io_backend == "kernel" and self.layout == "layer_first":
+        if io_backend in ("kernel", "kernel_xpu") and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],
                 dst=self.device_page_views[layer_id],
@@ -1388,7 +1427,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.state_page_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend in ("kernel", "kernel_xpu") and self.layout == "page_first":
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_page_views[layer_id],
@@ -1872,7 +1911,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -1924,7 +1966,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -1971,7 +2016,10 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = (
+            io_backend in ("kernel", "kernel_xpu")
+            and self.indexer_page_stride_size % 8 == 0
+        )
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
