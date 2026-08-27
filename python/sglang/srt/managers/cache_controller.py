@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import deque
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -330,6 +331,10 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+
+        # (start_event, finish_event, num_bytes) per submitted D2H batch,
+        # read back once the batch completes. See _log_write_bandwidth.
+        self.write_timings = deque()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -683,6 +688,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        self.write_timings.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -738,6 +744,30 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
+    def _log_write_bandwidth(self) -> None:
+        """Report D2H bandwidth for batches that have finished.
+
+        The transfer kernels are submitted asynchronously, so a host timer around
+        the submit would measure launch overhead; the device events already
+        bracketing the batch give a device-side interval instead. Gated on
+        query(), so reading them never blocks and never adds a sync.
+
+        start_event is stamped by the scheduler stream rather than the write
+        stream, so the interval also covers any wait for the write stream to
+        reach this batch, plus whatever host work the transfer call does before
+        submitting. The transfer is therefore at most this slow: the reported
+        bandwidth is a lower bound, hence the <= and >=.
+        """
+        while self.write_timings and self.write_timings[0][1].query():
+            start_event, finish_event, num_bytes = self.write_timings.popleft()
+            elapsed_ms = start_event.elapsed_time(finish_event)
+            logger.info(
+                "[D2H] %.2f MiB in <=%.3f ms -> >=%.2f GiB/s",
+                num_bytes / (1 << 20),
+                elapsed_ms,
+                num_bytes / (1 << 30) / (elapsed_ms / 1e3) if elapsed_ms > 0 else 0.0,
+            )
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             logger.debug("[D2H] start_writing: write_queue empty, nothing to do")
@@ -764,8 +794,11 @@ class HiCacheController:
             self.write_stream,
         )
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # enable_timing is what makes elapsed_time() legal on these events; the
+        # write stream waits on start_event, so its timestamp is the moment the
+        # transfer became runnable.
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -800,6 +833,14 @@ class HiCacheController:
             len(self.ack_write_queue) + 1,
         )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+        # The draft pool is backed up above under the same finish event, so its
+        # bytes belong in the same measurement.
+        num_bytes = host_indices.numel() * self.mem_pool_host.size_per_token
+        if self.has_draft:
+            num_bytes += host_indices.numel() * self.mem_pool_host_draft.size_per_token
+        self.write_timings.append((start_event, finish_event, num_bytes))
+        self._log_write_bandwidth()
 
     def load(
         self,

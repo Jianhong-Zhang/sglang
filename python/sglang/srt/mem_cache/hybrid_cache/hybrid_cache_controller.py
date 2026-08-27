@@ -398,8 +398,8 @@ class HybridCacheController(BaseHiCacheController):
             self.move_hybrid_indices(op)
         )
         self.write_queue.clear()
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -418,6 +418,19 @@ class HybridCacheController(BaseHiCacheController):
                 resolved_pool_transfers,
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+
+        # Count the extra pools too: they share the batch's finish event, and on a
+        # hybrid model they dominate (a 50-layer sliding pool moves ~10x the bytes
+        # of a 10-layer anchor).
+        num_bytes = host_indices.numel() * self.mem_pool_host.size_per_token
+        for transfer in resolved_pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and transfer.host_indices is not None:
+                num_bytes += (
+                    transfer.host_indices.numel() * entry.host_pool.size_per_token
+                )
+        self.write_timings.append((start_event, finish_event, num_bytes))
+        self._log_write_bandwidth()
 
     def load(
         self,

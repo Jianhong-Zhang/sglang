@@ -239,6 +239,12 @@ const uintptr_t* raw_table(const at::Tensor& t) {
 // NULL entry (torch's silent >16 GiB pin_memory failure) is exactly what makes
 // the kernel fault. Copies the table to host, so it costs a sync.
 void check_table(const at::Tensor& t, const char* name) {
+  // DISABLED: the copy below blocks the calling thread until the whole device
+  // drains -- ~410 ms per launch with a busy forward stream, plus ~6% of the
+  // transfer's own device time. The same NULL entries are already reported
+  // host-side by the null_layers list in backup_from_device_all_layer, which
+  // reads data_ptr() and needs no sync. Delete this return to re-enable.
+  return;
   auto host = t.to(at::kCPU);
   const auto* p = reinterpret_cast<const uintptr_t*>(host.data_ptr());
   const int64_t n = host.numel();
