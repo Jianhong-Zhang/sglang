@@ -57,8 +57,12 @@ device_module = get_device_module()
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [
+            device_module.Event(enable_timing=True) for _ in range(num_layers)
+        ]
+        # Start event on the controller stream. enable_timing here and above is what
+        # lets start_loading read H2D bandwidth off the events the ack already carries.
+        self.start_event = device_module.Event(enable_timing=True)
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -332,9 +336,10 @@ class HiCacheController:
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        # (start_event, finish_event, num_bytes) per submitted D2H batch,
-        # read back once the batch completes. See _log_write_bandwidth.
+        # (start_event, finish_event, num_bytes) per submitted batch, read back
+        # once the batch completes. See _log_transfer_bandwidth.
         self.write_timings = deque()
+        self.load_timings = deque()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -689,6 +694,7 @@ class HiCacheController:
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self.write_timings.clear()
+        self.load_timings.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -744,25 +750,51 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def _log_write_bandwidth(self) -> None:
-        """Report D2H bandwidth for batches that have finished.
+    def _transfer_num_bytes(self, host_indices: torch.Tensor) -> int:
+        """Bytes one batch moves, across every layer of every pool it touches.
+
+        The draft pool rides in the same batch under the same events, so its bytes
+        belong in the same measurement.
+        """
+        num_bytes = host_indices.numel() * self.mem_pool_host.size_per_token
+        if self.has_draft:
+            num_bytes += host_indices.numel() * self.mem_pool_host_draft.size_per_token
+        return num_bytes
+
+    def log_transfer_bandwidth(self) -> None:
+        """Drain finished transfer timings in both directions.
+
+        Called once per scheduler step, because the submit paths only drain when a
+        *new* batch is submitted: a workload with a single batch would otherwise
+        never report it.
+        """
+        self._log_transfer_bandwidth(self.write_timings, "D2H")
+        self._log_transfer_bandwidth(self.load_timings, "H2D")
+
+    def _log_transfer_bandwidth(self, timings: deque, label: str) -> None:
+        """Report bandwidth for transfers that have finished, D2H or H2D.
 
         The transfer kernels are submitted asynchronously, so a host timer around
         the submit would measure launch overhead; the device events already
         bracketing the batch give a device-side interval instead. Gated on
         query(), so reading them never blocks and never adds a sync.
 
-        start_event is stamped by the scheduler stream rather than the write
-        stream, so the interval also covers any wait for the write stream to
-        reach this batch, plus whatever host work the transfer call does before
-        submitting. The transfer is therefore at most this slow: the reported
-        bandwidth is a lower bound, hence the <= and >=.
+        start_event is stamped by the scheduler stream rather than the transfer
+        stream, so the interval also covers any wait for that stream to reach
+        this batch, plus whatever host work the transfer call does before
+        submitting -- and for H2D, the per-layer launch gaps between all
+        layer_num submissions. The transfer is therefore at most this slow: the
+        reported bandwidth is a lower bound, hence the <= and >=.
+
+        H2D callers must poll before update_producer recycles a LayerLoadingEvent,
+        or a timing would be attributed to the wrong batch.
         """
-        while self.write_timings and self.write_timings[0][1].query():
-            start_event, finish_event, num_bytes = self.write_timings.popleft()
+        while timings and timings[0][1].query():
+            start_event, finish_event, num_bytes = timings.popleft()
             elapsed_ms = start_event.elapsed_time(finish_event)
             logger.info(
-                "[D2H] %.2f MiB in <=%.3f ms -> >=%.2f GiB/s",
+                "[%s] %.2f MiB in <=%.3f ms -> >=%.2f GiB/s",
+                label,
                 num_bytes / (1 << 20),
                 elapsed_ms,
                 num_bytes / (1 << 30) / (elapsed_ms / 1e3) if elapsed_ms > 0 else 0.0,
@@ -834,13 +866,9 @@ class HiCacheController:
         )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
-        # The draft pool is backed up above under the same finish event, so its
-        # bytes belong in the same measurement.
-        num_bytes = host_indices.numel() * self.mem_pool_host.size_per_token
-        if self.has_draft:
-            num_bytes += host_indices.numel() * self.mem_pool_host_draft.size_per_token
+        num_bytes = self._transfer_num_bytes(host_indices)
         self.write_timings.append((start_event, finish_event, num_bytes))
-        self._log_write_bandwidth()
+        self._log_transfer_bandwidth(self.write_timings, "D2H")
 
     def load(
         self,
@@ -887,6 +915,9 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
+        # Read pending timings before update_producer recycles their events.
+        self._log_transfer_bandwidth(self.load_timings, "H2D")
+
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices = self.move_indices(
@@ -928,6 +959,13 @@ class HiCacheController:
                 start_event=producer_event.start_event,
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
+            )
+        )
+        self.load_timings.append(
+            (
+                producer_event.start_event,
+                producer_event.finish_event,
+                self._transfer_num_bytes(host_indices),
             )
         )
         return producer_id

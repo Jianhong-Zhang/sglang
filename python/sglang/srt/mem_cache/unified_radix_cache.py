@@ -2472,6 +2472,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         self.writing_check()
         self.loading_check()
+        if self.cache_controller is not None:
+            self.cache_controller.log_transfer_bandwidth()
         if self.enable_storage:
             self.drain_storage_control_queues()
         self._reap_completed_async_work()

@@ -419,18 +419,29 @@ class HybridCacheController(BaseHiCacheController):
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
-        # Count the extra pools too: they share the batch's finish event, and on a
-        # hybrid model they dominate (a 50-layer sliding pool moves ~10x the bytes
-        # of a 10-layer anchor).
+        num_bytes = self._hybrid_num_bytes(host_indices, resolved_pool_transfers)
+        self.write_timings.append((start_event, finish_event, num_bytes))
+        self._log_transfer_bandwidth(self.write_timings, "D2H")
+
+    def _hybrid_num_bytes(
+        self,
+        host_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]],
+    ) -> int:
+        """Bytes one batch moves: the anchor KV pool plus every extra pool.
+
+        The extra pools share the batch's events and dominate on a hybrid model --
+        a 50-layer sliding pool moves ~10x the bytes of a 10-layer anchor -- so
+        counting the anchor alone would understate bandwidth by that factor.
+        """
         num_bytes = host_indices.numel() * self.mem_pool_host.size_per_token
-        for transfer in resolved_pool_transfers or []:
+        for transfer in pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(transfer.name)
             if entry is not None and transfer.host_indices is not None:
                 num_bytes += (
                     transfer.host_indices.numel() * entry.host_pool.size_per_token
                 )
-        self.write_timings.append((start_event, finish_event, num_bytes))
-        self._log_write_bandwidth()
+        return num_bytes
 
     def load(
         self,
@@ -478,6 +489,8 @@ class HybridCacheController(BaseHiCacheController):
     def start_loading(self) -> int:
         if not self.load_queue:
             return -1
+        # Read pending timings before update_producer recycles their events.
+        self._log_transfer_bandwidth(self.load_timings, "H2D")
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
@@ -509,6 +522,13 @@ class HybridCacheController(BaseHiCacheController):
                 producer_event.start_event,
                 producer_event.finish_event,
                 op.node_ids,
+            )
+        )
+        self.load_timings.append(
+            (
+                producer_event.start_event,
+                producer_event.finish_event,
+                self._hybrid_num_bytes(host_indices, resolved_pool_transfers),
             )
         )
         return producer_id
