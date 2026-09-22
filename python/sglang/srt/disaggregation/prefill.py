@@ -1155,7 +1155,7 @@ class SchedulerDisaggregationPrefillMixin:
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         if self.enable_overlap:
-            ev = torch.cuda.Event()
+            ev = torch.get_device_module(self.forward_stream.device).Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
