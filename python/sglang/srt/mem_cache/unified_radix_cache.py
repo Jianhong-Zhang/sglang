@@ -244,6 +244,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Hard-coded on; upstream gates this on
+        # server_args.disable_hicache_l1_prefix_reuse, which does not exist here.
+        # Must live here, not init_hicache: cache_finished_req reads it on every
+        # request, including with hicache off.
+        self.disable_hicache_l1_prefix_reuse = False
+        self._l1_demote_in_progress = False
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -536,6 +542,12 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        print(
+            f"[no-L1-prefix] match_prefix: req_tokens={len(params.key)} "
+            f"L1(device)_hit={len(result.device_indices)} "
+            f"L2(host)_hit={result.host_hit_length}",
+            flush=True,
+        )
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -692,6 +704,79 @@ class UnifiedRadixCache(BasePrefixCache):
         self._free_values(result.device_frees, result.host_frees)
         self._accumulate_tracker(tracker, result.tracker)
         return result.is_dropped
+
+    def _is_l1_demote_candidate(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        return (
+            not self.tree_core.is_root(node.id)
+            and node in self.tree_core.evictable_device_leaves
+            # component_data is a list indexed by ComponentType and sized for
+            # every type, so only the components this tree actually uses count.
+            and all(
+                node.component_data[ct].lock_ref == 0 for ct in self.tree_components
+            )
+            and not node.evicted
+            and node.backuped
+            and cd.value is not None
+            # In-flight DMA. ongoing_write_through / ongoing_load_back are keyed
+            # by ack id, not node id, so read the node's own pending markers.
+            and node.write_through_pending_id is None
+            and node.load_back_pending_id is None
+        )
+
+    def _maybe_demote_backuped_l1_leaves(self) -> int:
+        if not self.disable_hicache_l1_prefix_reuse:
+            return 0
+
+        if self._l1_demote_in_progress:
+            return 0
+
+        # evictable_device_leaves is python-core state; the rust core exposes
+        # only the step-wise eviction walk, which destroys unbacked leaves
+        # rather than demoting backed-up ones.
+        if not isinstance(self.tree_core, UnifiedTreeCore):
+            raise NotImplementedError(
+                "disable_hicache_l1_prefix_reuse requires "
+                "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python, got "
+                f"{type(self.tree_core).__name__}."
+            )
+
+        self._l1_demote_in_progress = True
+        try:
+            total = 0
+            tracker = {ct: 0 for ct in self.tree_components}
+
+            while True:
+                victims = [
+                    node
+                    for node in list(self.tree_core.evictable_device_leaves)
+                    if self._is_l1_demote_candidate(node)
+                ]
+
+                if not victims:
+                    return total
+
+                progressed = False
+                for node in victims:
+                    # Re-check because demoting one leaf can change parent/child state.
+                    if not self._is_l1_demote_candidate(node):
+                        continue
+
+                    num_tokens = len(node.component_data[BASE_COMPONENT_TYPE].value)
+                    self._demote(node.id, tracker)
+                    total += num_tokens
+                    progressed = True
+                    print(
+                        f"[no-L1-prefix] demoted node_id={node.id} "
+                        f"tokens={num_tokens} off GPU (still on host); "
+                        f"evictable_size={self.evictable_size()}",
+                        flush=True,
+                    )
+
+                if not progressed:
+                    return total
+        finally:
+            self._l1_demote_in_progress = False
 
     def _evict_components(
         self,
@@ -921,6 +1006,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+
+        self._maybe_demote_backuped_l1_leaves()
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -2656,10 +2743,19 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+
+            did_ack = False
+
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
+
+                did_ack = True
+
             self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+            if did_ack:
+                self._maybe_demote_backuped_l1_leaves()
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
@@ -2681,6 +2777,8 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+
+        did_ack = False
         if finish_count is None:
             # Every rank must enter the all_reduce below; ongoing_load_back can
             # diverge across ranks.
@@ -2711,6 +2809,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+
+                did_ack = True
+
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
 
@@ -2728,6 +2829,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         duration_ms / 1000.0
                     )
             finish_count -= 1
+
+        if did_ack:
+            self._maybe_demote_backuped_l1_leaves()
 
     # ---- HiCache: Scheduler Entry Points ----
 
