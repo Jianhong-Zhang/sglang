@@ -782,7 +782,8 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 5. torch._scaled_mm (if Intel XPU)
+    # 6. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -792,6 +793,8 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif _is_xpu:
+        return xpu_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -1274,6 +1277,64 @@ def triton_w8a8_block_fp8_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _xpu_per_token_group_quant_fp8(
+    x: torch.Tensor, group_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Native SYCL quant wins at decode sizes (Triton launch overhead); Triton is faster from M~512.
+    m, k = x.shape
+    if m > 256:
+        return per_token_group_quant_fp8(x, group_size, column_major_scales=False)
+
+    from sgl_kernel import sgl_per_token_group_quant_8bit
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    q = torch.empty((m, k), device=x.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty((m, k // group_size), device=x.device, dtype=torch.float32)
+    sgl_per_token_group_quant_8bit(
+        x, q, s, group_size, 1e-10, finfo.min, finfo.max, enable_v2=False
+    )
+    return q, s
+
+
+def xpu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # torch._scaled_mm on XPU (oneDNN) takes 1x128 act / 128x128 weight scales natively.
+    n, k = weight.shape
+    if (
+        input_scale is not None
+        or list(block_size) != [128, 128]
+        or n % 128 != 0
+        or k % 128 != 0
+    ):
+        return triton_w8a8_block_fp8_linear(
+            input=input,
+            weight=weight,
+            block_size=block_size,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+        )
+
+    input_2d = input.view(-1, k)
+    output_shape = [*input.shape[:-1], n]
+    q_input, x_scale = _xpu_per_token_group_quant_fp8(input_2d, block_size[1])
+    output = torch._scaled_mm(
+        q_input,
+        weight.t(),
+        scale_a=x_scale,
+        scale_b=weight_scale.t(),
+        out_dtype=input_2d.dtype,
+        bias=bias,
+    )
+    return output.view(*output_shape)
 
 
 @lru_cache(maxsize=1)
