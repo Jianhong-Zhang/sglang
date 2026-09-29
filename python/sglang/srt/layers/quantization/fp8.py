@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    xpu_w8a8_block_fp8_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -720,6 +721,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_shape=layer.weight.shape,
             )
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+            if self.w8a8_block_fp8_linear is xpu_w8a8_block_fp8_linear:
+                # Column-major so scale.t() is contiguous; _scaled_mm otherwise copies it per call.
+                weight_scale = weight_scale.t().contiguous().t()
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
