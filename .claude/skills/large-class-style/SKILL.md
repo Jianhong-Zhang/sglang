@@ -11,16 +11,16 @@ Conventions for SGLang's three large classes:
 - `TokenizerManager` — `python/sglang/srt/managers/tokenizer_manager.py`
 - `ModelRunner` — `python/sglang/srt/model_executor/model_runner.py`
 
+§1 applies to the frozen files listed in §1.2; §2 applies to all three classes.
+
 ## 1. Frozen Code
 
 - Some core files are **frozen**: *orchestration-only* — a thin composition root that constructs collaborators, wires them, delegates to them, and coordinates the calls. They must stay that way.
-- **Domain logic does not belong in a frozen file**; it lives in a collaborator class in its own module.
+- **Domain logic does not belong in a frozen file**; it lives in a collaborator class in its own module. The orchestrator may know about every collaborator, because wiring and sequencing them is its job.
 
 ### 1.1 Why
 
-- The file is a thin orchestrator over collaborator classes; freezing keeps it that way and stops it growing back into a god class.
-- Keeping domain logic in collaborators (their own files) is what makes per-file code ownership, single responsibility, and unit testing possible.
-- The orchestrator is the composition root: it may know about every collaborator, because wiring and sequencing them is its job. Coordination stays here — domain logic does not.
+Freezing stops the file growing back into a god class, and domain logic in its own module keeps per-file ownership, single responsibility and unit testing possible.
 
 ### 1.2 Frozen files
 
@@ -30,7 +30,7 @@ Conventions for SGLang's three large classes:
 
 Every statement refers to a collaborator and is one of:
 
-1. **Construct** — a short `init_<thing>` helper whose body is essentially a single construction (follows §2); use `maybe_init_<thing>` with a one-line gate when conditional.
+1. **Construct** — a short `init_<thing>` / `maybe_init_<thing>` helper whose body is essentially a single construction (naming and gating per §2.2).
 2. **Wire** — a short call that runs the helper from the orchestrator (e.g. in `__init__`).
 3. **Delegate** — calls to a collaborator's methods at the necessary call sites (`self.foo.run(...)`).
 4. **Coordinate** — the minimal control flow that *selects or orders* the above: an `if` choosing whether / which collaborator to wire or call, the order of calls, threading one call's result into the next.
@@ -53,7 +53,6 @@ self.baz.consume(out)                      # coordinate: thread result into next
 ### 1.4 Not allowed: domain logic
 
 - Config building, data transformation, algorithm bodies, math, post-processing — any branch or loop that *computes* rather than *coordinates*.
-- It belongs in the collaborator.
 
 ```python
 # NOT allowed in a frozen file: domain logic inlined.
@@ -86,7 +85,7 @@ if self.server_args.enable_foo:
 
 - A callee that genuinely takes the live object should **read** fields off it and **return** results; it writes fields back only when there is genuinely no other way.
 - The orchestrator owns the assignment onto its own fields.
-- Why: a callee that mutates the god object scatters its writes across other modules — you can no longer see what `ModelRunner` owns by reading `model_runner.py`, the hidden writes race with the orchestrator's own ordering, and the callee silently depends on being invoked at exactly the right moment.
+- Why: writes scattered across other modules hide what the class owns, race with the orchestrator's ordering, and tie the callee to being called at exactly the right moment.
 
 ```python
 # Good — callee reads the runner and returns a small frozen struct; the orchestrator
@@ -119,10 +118,7 @@ Apply when modifying the `__init__` of the three classes above.
 
 ### 2.1 Why
 
-- Downstream forks override one piece (tokenizer, KV cache, IPC, …).
-- Inline logic forces them to copy the whole `__init__`, which rots against upstream.
-- Splitting into `init_*` helpers lets them override exactly what they need.
-- Reference shape: `TokenizerManager.__init__` in `python/sglang/srt/managers/tokenizer_manager.py`.
+Downstream forks override one piece (tokenizer, KV cache, IPC, …); `init_*` helpers let them override just that instead of copying an `__init__` that rots against upstream. Reference shape: `TokenizerManager.__init__` in `python/sglang/srt/managers/tokenizer_manager.py`.
 
 ### 2.2 Rules
 
@@ -137,3 +133,11 @@ Apply when modifying the `__init__` of the three classes above.
 
 - Only the three classes listed above.
 - Not other manager-style classes, not small dataclass/utility constructors.
+
+## Done check
+
+Before submitting a change to one of the three classes:
+
+- [ ] In a §1.2 frozen file, every added statement is construct / wire / delegate / coordinate (§1.3); any computing body lives in a collaborator.
+- [ ] Extracted collaborators take narrow keyword args and return results; none writes fields back onto the god object (§1.6–1.7).
+- [ ] In any of the three `__init__`s, new logic is a new `init_<thing>` / `maybe_init_<thing>` helper and existing `init_*` signatures are unchanged, or the break is called out in the PR (§2.2).

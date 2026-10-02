@@ -1,5 +1,14 @@
 # Overlap Heuristics
 
+## Contents
+
+- What Comes From Which Trace
+- What It Treats As Hidden
+- Category Heuristics
+- How To Read The Action Table
+- Dependency Signal
+- Important Limits
+
 This analyzer is intentionally conservative.
 
 ## What Comes From Which Trace
