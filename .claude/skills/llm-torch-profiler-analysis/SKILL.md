@@ -19,10 +19,11 @@ Rows below that are hidden by default unless the user asks for a lower cutoff.
 Keep the fuse-pattern table source-backed and deterministic.
 Do not turn it into a fuzzy matcher.
 
-On Intel XPU a trace has no device-execution timeline: the rows are
-`urEnqueueKernelLaunch` runtime events, so the GPU-time column is host
-launch-dispatch time, not device time. The script prints this note under the
-tables; carry it into the summary.
+On Intel XPU, the GPU-time column is device-execution time when the trace has a
+device timeline (`cat=="kernel"` events). Only when it does not, the script falls
+back to `urEnqueueKernelLaunch` runtime rows, which are host launch-dispatch time,
+and prints a "Note (Intel XPU)" under the kernel table. Carry that note into the
+summary when the report prints it; without it, report the times as device time.
 
 ## Scripts
 
