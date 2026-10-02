@@ -1,23 +1,11 @@
 ---
 name: debug-distributed-hang
-description: Debug hanging issues in SGLang distributed inference (TP/PP/DP/EP). Covers identifying hang locations via py-spy/watchdog/cuda coredump, per-rank logging to find state divergence, binary-search methodology for locating the first diverge point, and fix patterns. Use when a multi-GPU SGLang run hangs, freezes, or times out during collective operations.
+description: Debugs hanging issues in SGLang distributed inference (TP/PP/DP/EP). Covers identifying hang locations via py-spy/watchdog/cuda coredump, per-rank logging to find state divergence, binary-search methodology for locating the first diverge point, and fix patterns. Use when a multi-GPU SGLang run hangs, freezes, hits a collective timeout, or the scheduler watchdog fires.
 ---
 
 # Debugging Distributed Hangs in SGLang
 
-## Overview
-
-Hangs in distributed inference happen when ranks diverge in state, causing collective operations (AllGather, AllReduce, Broadcast, Barrier) to deadlock. Common causes:
-
-- **Size mismatch**: ranks pass different tensor sizes to a collective
-- **Branch divergence**: one rank enters a collective, another skips it
-- **Cascading state drift**: a small non-determinism (e.g., floating-point) propagates into different batch structures
-- **Resource exhaustion**: one rank OOMs or crashes, others wait forever
-
-## Prerequisites
-
-- **py-spy**: `pip install py-spy` or system package. Requires root or `CAP_SYS_PTRACE` to attach to running processes.
-- **cuda-gdb**: Ships with the CUDA toolkit. Ensure it's on your `PATH`.
+Ranks whose state diverged deadlock in a collective (AllGather, AllReduce, Broadcast, Barrier): a size mismatch, one rank skipping a collective, small non-determinism drifting into different batches, or one rank dying while the others wait.
 
 ## Step 1: Confirm and Locate the Hang
 
@@ -42,7 +30,7 @@ SGLang has two watchdog modes (see `python/sglang/srt/utils/watchdog.py`):
 - **Hard watchdog** (`soft=False`, default): dumps py-spy traces then sends `SIGQUIT` to kill the parent process.
 - **Soft watchdog** (`soft=True`): only logs the timeout without killing the process, giving you more time to manually attach debuggers or collect coredumps.
 
-If the watchdog doesn't trigger, manually dump:
+If the watchdog doesn't trigger, manually dump (py-spy needs root or `CAP_SYS_PTRACE` to attach):
 
 ```bash
 py-spy dump --pid <scheduler_pid>
@@ -57,37 +45,12 @@ export NCCL_DEBUG_SUBSYS=COLL
 
 Look for the last collective logged before the hang. Mismatched sizes show up as one rank waiting and another never entering.
 
+On XPU use the oneCCL equivalents (`CCL_LOG_LEVEL`).
+
 ### 1c. CUDA Coredump
 
-When a process hangs, you can trigger a GPU coredump on demand to see which kernel is stuck. Set these env vars before launching:
-
-```bash
-export CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1
-export CUDA_COREDUMP_PIPE="/tmp/cuda_pipe_%h_%p"
-export CUDA_COREDUMP_FILE="/tmp/cuda_coredump_%h_%p"
-export CUDA_COREDUMP_SHOW_PROGRESS=1
-export CUDA_COREDUMP_GENERATION_FLAGS='skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory'
-```
-
-While the process is hanging, find the pipe via `/proc/<pid>/fd/` and write to it to trigger the dump:
-
-```bash
-ls /proc/<pid>/fd/ -la 2>/dev/null | grep cuda_pipe
-dd if=/dev/zero bs=1M count=1 > /tmp/cuda_pipe_<hostname>_<pid>
-```
-
-Alternatively, if you don't need to keep the process alive, `kill -SIGABRT <pid>` also triggers a CUDA coredump (but terminates the process).
-
-Then open with `cuda-gdb --batch -ex "target cudacore <coredump_file>"`. On load, it immediately shows which kernel is stuck. For example:
-
-```
-Opening GPU coredump: <coredump_file>
-[Current focus set to CUDA kernel 0, grid 622721, cluster (4,0,0), block (16,0,0), thread (64,0,0), device 0, sm 0, warp 0, lane 0]
-#0  0x00007f8029b2b040 in ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)<<<(24,1,1),(512,1,1)>>> ()
-```
-
-This told us the hang was in an NCCL AllGather — not a compute kernel. Combined with the py-spy stack pointing to `LogitsProcessor.forward` → `tensor_model_parallel_all_gather`, we knew it was an AllGather size mismatch between TP ranks.
-
+When py-spy shows a rank blocked in a CUDA synchronize and you need the GPU kernel it waits on, take a GPU coredump:
+see [references/cuda-coredump.md](references/cuda-coredump.md).
 
 ### 1d. Identify the Collective
 
@@ -205,13 +168,17 @@ Compare the hashes. Some inputs will match, some won't. The non-matching input i
 
 For the non-matching input, trace where it was produced and repeat: hash its inputs, diff across ranks, find the divergent one. Continue until you reach the root cause.
 
+Done when the first input whose hash differs across ranks was produced from inputs that match.
+
 ## Step 5: Common Root Causes and Fixes
 
 ### Floating-Point Non-Determinism
 
 **Symptom**: All "logical" inputs are identical (same logits after all-gather), but derived floating-point values (softmax, probabilities) differ across GPUs.
 
-**Example**: EAGLE speculative decoding — `F.softmax` → `top_k_renorm_prob` → `top_p_renorm_prob` produces slightly different `target_probs` on each GPU. The sampling kernel then picks different tokens. These flow into `output_ids` → radix cache → different prefix match depths → different `extend_seq_lens` → AllGather size mismatch → hang.
+**Example**: in speculative-decoding verification, a softmax and top-k/top-p renormalization yield slightly different probabilities per GPU, so sampling picks different tokens. Those tokens reach the radix cache, prefix-match depths differ, extend lengths differ, and the next AllGather gets mismatched sizes and hangs.
+
+**Fix**: compute the value on rank 0 and `broadcast(result, src=0)`, so every rank uses the same one.
 
 ### Random Number Divergence
 
@@ -234,15 +201,3 @@ For the non-matching input, trace where it was produced and repeat: hash its inp
 ## Step 6: Verify the Fix
 
 Run the failing test multiple times to confirm the fix is stable. Intermittent hangs require many runs. A test that hung ~30% of the time needs at least 10 clean passes to be confident.
-
-## Quick Reference
-
-| Technique | When to Use |
-|-----------|-------------|
-| py-spy dump | First step — see where each rank is stuck |
-| `NCCL_DEBUG=INFO` | Identify which collective and sizes |
-| CUDA coredump + `cuda-gdb` | See which GPU kernel is blocked |
-| Per-rank log files | Compare rank states over time |
-| Hash of tensors | Efficiently compare large tensors across ranks |
-| `diff` on extracted events | Find the exact step of divergence |
-| `broadcast(result, src=0)` | Fix floating-point or sampling non-determinism |
