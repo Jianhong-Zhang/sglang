@@ -1,11 +1,9 @@
 ---
 name: env-var-conventions
-description: Conventions for SGLang environment variables — where to define, how to access, how to name, and how to deprecate. Use when adding, renaming, or reviewing any `SGLANG_*` environment variable (or migrating a legacy `SGL_*` alias), or when touching `python/sglang/srt/environ.py`.
+description: Defines the conventions for SGLang environment variables — where to define, how to access, how to name, and how to deprecate. Use when adding, renaming, or reviewing any `SGLANG_*` environment variable (or migrating a legacy `SGL_*` alias), or when touching `python/sglang/srt/environ.py`.
 ---
 
 # Environment Variables — Conventions
-
-Apply this skill when adding, renaming, or reviewing any sglang-owned environment variable (`SGLANG_*`, or a legacy `SGL_*` alias being phased out), or when touching `python/sglang/srt/environ.py`.
 
 ## Rule 1 — Define in the `Envs` class in `python/sglang/srt/environ.py`
 
@@ -18,8 +16,8 @@ Group the new entry under an existing section comment (e.g. `# Logging Options`,
 | Variable | Owner | Goes through `Envs`? |
 |---|---|---|
 | `SGLANG_*` | sglang | **Always.** The canonical prefix for all new entries. |
-| `MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`, `USE_TRITON_W8A8_FP8_KERNEL`, `HF_HUB_DISABLE_XET`, `DISABLE_OPENAPI_DOC` | Upstream/vendor alias that sglang wants to centralize | **Yes** — register in `Envs` so `.get()` / `.override()` work uniformly. Keep the upstream prefix. |
-| `CUDA_*`, `NCCL_*`, `TORCH_*`, `OMP_*`, `HF_HUB_*` (raw upstream) | External tooling | **No.** Read with `os.getenv` — they're set by the launcher / driver, not by sglang. |
+| `MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`, `USE_TRITON_W8A8_FP8_KERNEL`, `HF_HUB_DISABLE_XET`, `DISABLE_OPENAPI_DOC` | Upstream/vendor alias that sglang wants to centralize | **Yes** — register in `Envs` so `.get()` / `.override()` work uniformly. Keep the upstream prefix: it is the canonical name, and the `SGLANG_` naming rules in Rule 4 don't apply. |
+| `CUDA_*`, `NCCL_*`, `ZE_*`, `SYCL_*`, `CCL_*`, `ONEAPI_*`, `TORCH_*`, `OMP_*`, `HF_HUB_*` (raw upstream) | External tooling | **No.** Read with `os.getenv` — they're set by the launcher / driver, not by sglang. |
 | `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `HOME`, `PATH` | Distributed launcher / OS | **No.** `os.getenv` only. |
 | Test runner internals (`PYTEST_CURRENT_TEST`, etc.) | Test framework | **No.** `os.getenv` only. |
 
@@ -38,7 +36,7 @@ The rule of thumb: if the value's lifecycle is owned by sglang code (we read it,
 | `EnvTuple(())` | comma-separated list, parsed via `s.split(",")` and stripped |
 
 Default value:
-- For a knob whose "unset" state must be distinguishable from any concrete value, use `None` as the default (e.g. `EnvStr(None)`, `EnvInt(None)`). The descriptor handles set-to-None correctly via `_set_to_none`.
+- For a knob whose "unset" state must be distinguishable from any concrete value, use `None` as the default (e.g. `EnvStr(None)`, `EnvInt(None)`); see `.set(None)` vs `.clear()` below.
 - For a feature flag, the default encodes the production behavior. `ENABLE_FOO = EnvBool(False)` means foo is off in prod; `DISABLE_FOO = EnvBool(False)` means foo is on in prod. See Rule 4 on picking the verb.
 
 ### IntEnum for multi-state knobs
@@ -76,7 +74,7 @@ if envs.SGLANG_FOO.get():
 | Method | Use |
 |---|---|
 | `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. |
-| `.set(value)` | Set value. `set(None)` flips the internal `_set_to_none` flag so the next `.get()` returns `None`, not `default`. |
+| `.set(value)` | Set value. `set(None)` makes the next `.get()` return `None`, not `default`. |
 | `.clear()` | Unset entirely. Next `.get()` returns `default`. |
 | `.is_set()` | True iff the key is present in `os.environ` (regardless of value, including the explicit-None case). |
 | `.override(value)` | Context manager — set on enter, restore exactly what was there on exit. Use this in tests. |
@@ -131,7 +129,7 @@ The `allow_sglang=True` escape hatch exists for the rare case where you must byp
 
 ## Rule 4 — Naming: `SGLANG_` prefix + verb category
 
-Prefix is always `SGLANG_` for new entries. `SGL_*` is auto-translated to `SGLANG_*` with a `DeprecationWarning` in `_convert_SGL_to_SGLANG`; never add a new `SGL_*` key.
+Prefix is always `SGLANG_` for new entries (never `SGL_*`; see Rule 1).
 
 The second token signals intent. Pick the right verb up front — renames require an alias entry (Rule 5).
 
@@ -144,7 +142,7 @@ The second token signals intent. Pick the right verb up front — renames requir
 | `LOG_FOO` | Logging-only knob | `SGLANG_LOG_GC`, `SGLANG_LOG_MS` |
 | `TEST_FOO` | Test-only hook | `SGLANG_TEST_RETRACT`, `SGLANG_TEST_MAX_RETRY` |
 | `DEBUG_FOO` | Debug-only instrumentation | `SGLANG_DEBUG_MEMORY_POOL`, `SGLANG_DEBUG_SYMM_MEM` |
-| `OPT_FOO` | Perf-optimization toggle (heavily used by DSV4 work) | `SGLANG_OPT_USE_FUSED_HASH_TOPK`, `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2` |
+| `OPT_FOO` | Perf-optimization toggle | `SGLANG_OPT_USE_FUSED_HASH_TOPK`, `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2` |
 
 Picking between `ENABLE_FOO` and `DISABLE_FOO`: both verbs are valid. The only forbidden combination is `DISABLE_FOO = EnvBool(True)`, because it produces a true double-negative at the call site (`if not envs.SGLANG_DISABLE_FOO.get():` reads as "if not disabled"). All other combinations are fine:
 
@@ -154,8 +152,6 @@ Picking between `ENABLE_FOO` and `DISABLE_FOO`: both verbs are valid. The only f
 | `ENABLE_FOO = EnvBool(True)`  | `if envs.SGLANG_ENABLE_FOO.get():` | OK — on in prod, user opts out via `False` |
 | `DISABLE_FOO = EnvBool(False)` | `if not envs.SGLANG_DISABLE_FOO.get():` | OK — single negation, reads as "if enabled" |
 | `DISABLE_FOO = EnvBool(True)`  | `if not envs.SGLANG_DISABLE_FOO.get():` | **Forbidden** — true double-negative |
-
-`SGLANG_*` is the canonical sglang prefix. Vendor-integration keys (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`) keep their upstream prefix and live in the same `Envs` class — these are integration aliases, not sglang-owned feature flags.
 
 ## Rule 5 — Renames go through `*WithAlias` or `_print_deprecated_env`
 
@@ -198,6 +194,14 @@ Don't add a CLI flag that just forwards to an env var, and don't add an env var 
 
 ## Out of scope
 
-- **External / vendor env vars consumed raw** (`HF_HUB_*`, `CUDA_*`, `NCCL_*`, `TORCH_*`, `OMP_*`, `RANK`, `MASTER_ADDR`, etc.): see the decision table in Rule 1 — `os.getenv` is correct, don't pull them into `Envs`.
-- **Pre-existing `get_bool_env_var(...)` / `get_int_env_var(...)` call sites**: leave them as is; new code shouldn't add more, but mass-migration is out of scope for a feature PR.
-- **Upstream-aliased keys already in `Envs`** (`MOONCAKE_*`, `ASCEND_*`, `DEEP_NORMAL_*`, `IS_H200`, `USE_TRITON_W8A8_FP8_KERNEL`, `HF_HUB_DISABLE_XET`, `DISABLE_OPENAPI_DOC` — see Rule 1 decision table): the `SGLANG_` prefix rules in Rule 4 don't apply — the upstream prefix is the canonical name.
+- No mass migration of pre-existing `get_bool_env_var(...)` / `get_int_env_var(...)` call sites in a feature PR; leave them as is.
+
+## Done when
+
+The diff adds:
+
+- no `os.getenv("SGLANG_…")` and no `get_*_env_var("SGLANG_…")` call site,
+- no `SGL_*` key,
+- no `DISABLE_* = EnvBool(True)`,
+
+and each new key is an `EnvField` on `Envs`, under a section comment that fits it.
