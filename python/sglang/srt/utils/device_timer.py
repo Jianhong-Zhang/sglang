@@ -5,6 +5,8 @@ from typing import Callable, Deque, Dict, List, Optional
 
 import torch
 
+from sglang.srt.utils.common import get_device_module
+
 
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
     """Timing context for one forward segment; no-op when the timer is absent.
@@ -95,8 +97,8 @@ class GapTimer(DeviceTimer):
 
 @dataclass
 class _TimingInterval:
-    start_event: torch.cuda.Event
-    end_event: Optional[torch.cuda.Event] = None
+    start_event: torch.Event
+    end_event: Optional[torch.Event] = None
     metadata: Optional[Dict] = None
     _started: bool = False
     _completed: bool = False
@@ -117,12 +119,13 @@ class _TimingInterval:
 
     @staticmethod
     def create():
-        start_event = torch.cuda.Event(enable_timing=True)
+        # Events of the active backend: torch.cuda.Event is a raising stub on XPU builds.
+        start_event = get_device_module().Event(enable_timing=True)
         start_event.record()
         return _TimingInterval(start_event=start_event)
 
     def end(self, metadata: Dict):
-        end_event = torch.cuda.Event(enable_timing=True)
+        end_event = get_device_module().Event(enable_timing=True)
         end_event.record()
 
         assert self.end_event is None
